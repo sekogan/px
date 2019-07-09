@@ -1,14 +1,12 @@
 from setuptools import setup
 
+import glob
 import os.path
 
-version = ""
+import pxlib.version
+version = pxlib.version.__version__
+
 here = os.path.abspath(os.path.dirname(__file__))
-with open(os.path.join(here, "px.py")) as f:
-    for line in f.readlines():
-        if "__version__" in line:
-            version = line.strip().replace('"', '').split()[-1]
-            break
 
 long_description = ""
 with open(os.path.join(here, "README.md")) as f:
@@ -39,7 +37,7 @@ setup(
         "Topic :: Internet :: Proxy Servers"
     ],
     keywords = "proxy ntlm kerberos",
-    py_modules = ["px"],
+    py_modules = ["px"] + ["pxlib." + os.path.splitext(os.path.basename(path))[0] for path in glob.glob("pxlib/*.py")],
     install_requires = [
         'futures;python_version<"3.0"',
         "keyring",

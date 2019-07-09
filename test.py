@@ -5,6 +5,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 
@@ -158,14 +159,14 @@ def runPxTest(cmd, testproc, ips, port, proxy):
 
     return ret
 
-def runTest(test, python, count):
+def runTest(test, curdir, python, count):
     port = 3129
     cmd = "px "
     if python:
         port = getPyversion(python) * 10
-        cmd = python + " px.py "
+        cmd = python + " " + curdir + "/px.py "
 
-    cmd += "--debug --uniqlog " + test[0] + " --port=" + str(port)
+    cmd += "--config=" + curdir + "/px.ini --debug --uniqlog " + test[0] + " --port=" + str(port)
     testproc = test[1]
     ips = test[2]
 
@@ -326,25 +327,23 @@ def socketTestSetup():
 
 def auto():
     # Make temp directory
+    testrun = tempfile.gettempdir() + "/pxtestrun"
     try:
-        shutil.rmtree("testrun")
+        shutil.rmtree(testrun)
     except:
         pass
     time.sleep(1)
     try:
-        os.makedirs("testrun", exist_ok=True)
+        os.makedirs(testrun, exist_ok=True)
     except TypeError:
         try:
-            os.makedirs("testrun")
+            os.makedirs(testrun)
         except WindowsError:
             pass
 
-    os.chdir("testrun")
-
-    # Load base px.ini
-    shutil.copy("../px.ini", ".")
-    shutil.copy("../px.py", ".")
-    shutil.copy("../dist/px.exe", ".")
+    curdir = os.getcwd()
+    os.chdir(testrun)
+    shutil.copy(curdir + "/dist/px.exe", ".")
 
     # Setup tests
     socketTestSetup()
@@ -358,24 +357,24 @@ def auto():
         procs = []
 
         # Latest version
-        procs.append(runTest(test, PYTHON + "/python.exe", count))
+        procs.append(runTest(test, curdir, PYTHON + "/python.exe", count))
         count += 1
 
         if "--envs" in sys.argv:
             # Test different versions of Python
             pys = ["27", "35", "37"]
             for py in pys:
-                procs.append(runTest(test, PYTHON + "/envs/%s/python.exe" % py, count))
+                procs.append(runTest(test, curdir, PYTHON + "/envs/%s/python.exe" % py, count))
                 count += 1
 
         # Run px.exe
-        procs.append(runTest(test, None, count))
+        procs.append(runTest(test, curdir, None, count))
         count += 1
 
         if not waitprocs(procs):
             break
 
-    os.chdir("..")
+    os.chdir(curdir)
 
 def get_argval(name):
     for i in range(len(sys.argv)):
@@ -387,7 +386,7 @@ def get_argval(name):
     return ""
 
 if __name__ == "__main__":
-    """python test.py --proxy=testproxy.org:80 --baseurl=http://baseurl.com [--all]
+    """python test.py --proxy=testproxy.org:80 --baseurl=http://baseurl.com [--envs]
         Point test.py to the NTLM proxy server that Px should connect through
 
         Base URL is some base webpage which will be spidered for URLs to
@@ -406,5 +405,9 @@ if __name__ == "__main__":
 
     if PYTHON == "":
         PYTHON = "c:/Miniconda"
+
+    if "--nosocket" in sys.argv:
+        for i in ["--nohostonly", "--nogateway", "--noallow", "--nolisten"]:
+            sys.argv.append(i)
 
     auto()
