@@ -236,6 +236,13 @@ MODE_MANUAL = 4
 MODE_CONFIG_PAC = 5
 
 
+class LogLevel(object):
+    ERROR = (1, "ERR")
+    WARN = (2, "WRN")
+    INFO = (3, "inf")
+    DEBUG = (4, "dbg")
+
+
 class State(object):
     allow = netaddr.IPGlob("*.*.*.*")
     config = None
@@ -243,6 +250,8 @@ class State(object):
     exit = False
     hostonly = False
     logger = None
+    log_level = LogLevel.DEBUG
+    log_lock = threading.Lock()
     noproxy = netaddr.IPSet([])
     noproxy_hosts = []
     pac = ""
@@ -311,25 +320,47 @@ class Log(object):
             self.stdout.flush()
 
 
-def dprint(msg):
-    if State.logger is not None:
-        # Do locking to avoid mixing the output of different threads as there are
-        # two calls to print which could otherwise interleave
+def _format_timestamp(t):
+    lt = time.localtime(t)
+    ms = int(t * 1000) % 1000
+    return "{:02d}:{:02d}:{:02d}.{:03d}".format(lt.tm_hour, lt.tm_min, lt.tm_sec, ms)
+
+
+def _log(msg, level):
+    if State.logger is None:
+        return
+    if level > State.log_level:
+        return
+    with State.log_lock:
         sys.stdout.write(
-            multiprocessing.current_process().name
-            + ": "
-            + threading.current_thread().name
-            + ": "
-            + str(int(time.time()))
-            + ": "
-            + sys._getframe(1).f_code.co_name
-            + ": "
-            + msg
-            + "\n"
+            "{timestamp} [{level}] {process}/{thread} {func}: {message}\n".format(
+                timestamp=_format_timestamp(time.time()),
+                level=level[1],
+                process=multiprocessing.current_process().name,
+                thread=threading.current_thread().name,
+                func=sys._getframe(2).f_code.co_name,
+                message=msg.strip(),
+            )
         )
 
 
-def dfile():
+def log_error(msg):
+    _log(msg, level=LogLevel.ERROR)
+
+
+def log_warn(msg):
+    _log(msg, level=LogLevel.WARN)
+
+
+def log_info(msg):
+    _log(msg, level=LogLevel.INFO)
+
+
+def log_debug(msg):
+    _log(msg, level=LogLevel.DEBUG)
+
+
+def get_log_file_path():
     name = multiprocessing.current_process().name
     if "--quit" in sys.argv:
         name = "quit"
@@ -400,13 +431,16 @@ class AuthMessageGenerator:
                 self.get_response = self.get_response_ntlm
         elif proxy_type == "BASIC":
             if not State.username:
+                log_error("No username configured for Basic authentication")
             elif not password:
+                log_error("No password configured for Basic authentication")
             else:
                 # Colons are forbidden in usernames and passwords for basic auth
                 # but since this can happen very easily, we make a special check
                 # just for colons so people immediately understand that and don't
                 # have to look up other resources.
                 if ":" in State.username or ":" in password:
+                    log_error("Credentials contain invalid colon character")
                 else:
                     # Additionally check for invalid control characters as per
                     # RFC5234 Appendix B.1 (section CTL)
@@ -418,7 +452,7 @@ class AuthMessageGenerator:
                         char in State.username or char in password
                         for char in illegal_control_characters
                     ):
-                        dprint(
+                        log_error(
                             "Credentials contain invalid characters: %s"
                             % ", ".join(
                                 "0x" + "%x" % ord(char)
@@ -456,7 +490,7 @@ class AuthMessageGenerator:
             self.get_response = self.get_response_kerberos
 
     def get_response_sspi(self, challenge=None):
-        dprint("pywin32 SSPI")
+        log_debug("pywin32 SSPI")
         if challenge:
             challenge = b64decode(challenge)
         output_buffer = None
@@ -471,6 +505,7 @@ class AuthMessageGenerator:
         return response_msg
 
     def get_response_kerberos(self, challenge=""):
+        log_debug("winkerberos SSPI")
         try:
             winkerberos.authGSSClientStep(self.ctx, challenge)
             auth_req = winkerberos.authGSSClientResponse(self.ctx)
@@ -481,7 +516,7 @@ class AuthMessageGenerator:
         return auth_req
 
     def get_response_ntlm(self, challenge=""):
-        dprint("ntlm-auth")
+        log_debug("ntlm-auth")
         if challenge:
             challenge = b64decode(challenge)
         response_msg = b64encode(self.ctx.step(challenge))
@@ -489,7 +524,7 @@ class AuthMessageGenerator:
         return response_msg
 
     def get_response_basic(self, challenge=""):
-        dprint("basic")
+        log_debug("basic")
         return self.ctx
 
 
@@ -509,15 +544,15 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         try:
             httpserver.SimpleHTTPRequestHandler.handle_one_request(self)
         except socket.error as e:
-            dprint("Socket error: %s" % e)
+            log_debug("Socket error: %s" % e)
             if not hasattr(self, "_host_disconnected"):
                 self._host_disconnected = 1
-                dprint("Host disconnected")
+                log_debug("Host disconnected")
             elif self._host_disconnected < State.max_disconnect:
                 self._host_disconnected += 1
-                dprint("Host disconnected: %d" % self._host_disconnected)
+                log_debug("Host disconnected: %d" % self._host_disconnected)
             else:
-                dprint("Closed connection to avoid infinite loop")
+                log_debug("Closed connection to avoid infinite loop")
                 self.close_connection = True
 
     def address_string(self):
@@ -526,7 +561,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         return host
 
     def log_message(self, format, *args):
-        dprint(format % args)
+        log_debug(format % args)
 
     def __connect_socket(self, destination=None):
         # Already connected?
@@ -535,7 +570,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         dests = list(self.proxy_servers) if destination is None else [destination]
         for dest in dests:
-            dprint("New connection: " + str(dest))
+            log_debug("New connection: " + str(dest))
             proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
                 proxy_socket.connect(dest)
@@ -543,7 +578,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 self.proxy_socket = proxy_socket
                 break
             except Exception as e:
-                dprint("Connect failed: %s" % e)
+                log_debug("Connect failed: %s" % e)
                 # move a non reachable proxy to the end of the proxy list;
                 if len(self.proxy_servers) > 1:
                     # append first and then remove, this should ensure thread
@@ -559,6 +594,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         return False
 
     def __do_socket(self, xheaders={}, destination=None):
+        log_debug("Entering")
 
         # Connect to proxy or destination
         if not self.__connect_socket(destination):
@@ -575,7 +611,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         ua = False
         cmdstr = "%s %s %s\r\n" % (self.command, self.path, self.request_version)
         self.proxy_socket.sendall(cmdstr.encode("utf-8"))
-        dprint(cmdstr.strip())
+        log_debug(cmdstr.strip())
         for header in self.headers:
             hlower = header.lower()
             if hlower == "user-agent" and State.useragent != "":
@@ -586,9 +622,9 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
             self.proxy_socket.sendall(h.encode("utf-8"))
             if hlower != "authorization":
-                dprint("Sending %s" % h.strip())
+                log_debug("Sending %s" % h.strip())
             else:
-                dprint(
+                log_debug(
                     "Sending %s: sanitized len(%d)"
                     % (header, len(self.headers[header]))
                 )
@@ -603,7 +639,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 hlower == "transfer-encoding"
                 and self.headers[header].lower() == "chunked"
             ):
-                dprint("CHUNKED data")
+                log_debug("CHUNKED data")
                 chk = True
 
         if not keepalive and self.request_version.lower() == "http/1.0":
@@ -616,9 +652,9 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
             h = ("%s: %s\r\n" % (header, xheaders[header])).encode("utf-8")
             self.proxy_socket.sendall(h)
             if header.lower() != "proxy-authorization":
-                dprint("Sending extra %s" % h.strip())
+                log_debug("Sending extra %s" % h.strip())
             else:
-                dprint(
+                log_debug(
                     "Sending extra %s: sanitized len(%d)"
                     % (header, len(xheaders[header]))
                 )
@@ -626,13 +662,13 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         if self.command in ["POST", "PUT", "PATCH"]:
             if not hasattr(self, "body"):
-                dprint("Getting body for POST/PUT/PATCH")
+                log_debug("Getting body for POST/PUT/PATCH")
                 if cl:
                     self.body = self.rfile.read(cl)
                 else:
                     self.body = self.rfile.read()
 
-            dprint(
+            log_debug(
                 "Sending body for POST/PUT/PATCH: %d = %d" % (cl or -1, len(self.body))
             )
             self.proxy_socket.sendall(self.body)
@@ -646,15 +682,16 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         # Response code
         for i in range(2):
+            log_debug("Reading response code")
             line = self.__proxy_socket_file.readline(State.max_line)
             if line == b"\r\n":
                 line = self.__proxy_socket_file.readline(State.max_line)
             try:
                 resp.code = int(line.split()[1])
             except (ValueError, IndexError):
-                dprint("Bad response %s" % line)
+                log_debug("Bad response %s" % line)
                 if line == b"":
-                    dprint("Client closed connection")
+                    log_debug("Client closed connection")
                     return Response(444)
             if (
                 b"connection established" in line.lower()
@@ -662,14 +699,14 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 or resp.code == 304
             ):
                 resp.body = False
-            dprint("Response code: %d " % resp.code + str(resp.body))
+            log_debug("Response code: %d " % resp.code + str(resp.body))
 
             # Get response again if 100-Continue
             if not (expect and resp.code == 100):
                 break
 
         # Headers
-        dprint("Reading response headers")
+        log_debug("Reading response headers")
         while not State.exit:
             line = self.__proxy_socket_file.readline(State.max_line).decode("utf-8")
             if line == b"":
@@ -677,21 +714,21 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                     self.proxy_socket.shutdown(socket.SHUT_WR)
                     self.proxy_socket.close()
                     self.proxy_socket = None
-                dprint("Proxy closed connection: %s" % resp.code)
+                log_debug("Proxy closed connection: %s" % resp.code)
                 return Response(444)
             if line == "\r\n":
                 break
             nv = line.split(":", 1)
             if len(nv) != 2:
-                dprint("Bad header =>%s<=" % line)
+                log_debug("Bad header =>%s<=" % line)
                 continue
             name = nv[0].strip()
             value = nv[1].strip()
             resp.headers.append((name, value))
             if name.lower() != "proxy-authenticate":
-                dprint("Received %s: %s" % (name, value))
+                log_debug("Received %s: %s" % (name, value))
             else:
-                dprint("Received %s: sanitized (%d)" % (name, len(value)))
+                log_debug("Received %s: sanitized (%d)" % (name, len(value)))
 
             if name.lower() == "content-length":
                 resp.length = int(value)
@@ -722,7 +759,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
             proxy_type = State.proxy_type.get(self.proxy_address, State.auth)
             if proxy_type is None:
                 # New proxy, don't know type yet
-                dprint("Searching proxy type")
+                log_debug("Finding proxy type")
                 resp = self.__do_socket()
 
                 proxy_auth = ""
@@ -742,19 +779,21 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                     # current request) by clearing State.proxy_type in load_proxy
                     State.proxy_type[self.proxy_address] = proxy_type
 
-                dprint("Auth mechanisms: " + proxy_auth)
-                dprint("Selected: " + str(self.proxy_address) + ": " + str(proxy_type))
+                log_debug("Auth mechanisms: " + proxy_auth)
+                log_debug(
+                    "Selected: " + str(self.proxy_address) + ": " + str(proxy_type)
+                )
 
                 return resp, proxy_type
 
             return Response(407), proxy_type
 
     def __do_transaction(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         ipport = self.__get_destination()
         if ipport not in [False, True]:
-            dprint("Skipping auth proxying")
+            log_debug("Skipping auth proxying")
             resp = self.__do_socket(destination=ipport)
         elif ipport:
             # Get proxy type directly from do_proxy_type instead by accessing
@@ -767,14 +806,14 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
             if resp.code == 407:
                 # Unknown auth mechanism
                 if proxy_type is None:
-                    dprint("Unknown auth mechanism expected")
+                    log_debug("Unknown auth mechanism expected")
                     return resp
 
                 # Generate auth message
                 ntlm = AuthMessageGenerator(proxy_type, self.proxy_address[0])
                 ntlm_resp = ntlm.get_response()
                 if ntlm_resp is None:
-                    dprint("Bad auth response")
+                    log_debug("Bad auth response")
                     return Response(503)
 
                 self.__forward_data(resp, discard=True)
@@ -784,7 +823,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                     if i in self.headers:
                         hconnection = self.headers[i]
                         del self.headers[i]
-                        dprint("Remove header %s: %s" % (i, hconnection))
+                        log_debug("Remove header %s: %s" % (i, hconnection))
 
                 # Send auth message
                 resp = self.__do_socket(
@@ -794,7 +833,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                     }
                 )
                 if resp.code == 407:
-                    dprint("Auth required")
+                    log_debug("Auth required")
                     ntlm_challenge = ""
                     for header in resp.headers:
                         if (
@@ -807,40 +846,40 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                                 break
 
                     if ntlm_challenge:
-                        dprint("Challenged")
+                        log_debug("Challenged")
                         ntlm_resp = ntlm.get_response(ntlm_challenge)
                         if ntlm_resp is None:
-                            dprint("Bad auth response")
+                            log_debug("Bad auth response")
                             return Response(503)
 
                         self.__forward_data(resp, discard=True)
 
                         if hconnection != "":
                             self.headers["Connection"] = hconnection
-                            dprint("Restore header Connection: " + hconnection)
+                            log_debug("Restore header Connection: " + hconnection)
 
                         # Reply to challenge
                         resp = self.__do_socket(
                             {"Proxy-Authorization": "%s %s" % (proxy_type, ntlm_resp)}
                         )
                     else:
-                        dprint("Didn't get challenge, auth didn't work")
+                        log_debug("Didn't get challenge, auth didn't work")
                 else:
-                    dprint("No auth required cached")
+                    log_debug("No auth required cached")
             else:
-                dprint("No auth required")
+                log_debug("No auth required")
         else:
-            dprint("No proxy server specified and not in noproxy list")
+            log_debug("No proxy server specified and not in noproxy list")
             return Response(501)
 
         return resp
 
     def do_HEAD(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         self.do_GET()
 
-        dprint("Done")
+        log_debug("Done")
 
     def do_PAC(self):
         resp = Response(404)
@@ -848,7 +887,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
             pac = State.pac
             if "file://" in State.pac:
                 pac = file_url_to_local_path(State.pac)
-            dprint(pac)
+            log_debug(pac)
             try:
                 resp.code = 200
                 with open(pac) as p:
@@ -864,74 +903,74 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         return resp
 
     def do_GET(self):
-        dprint("Entering")
+        log_debug("Entering")
 
-        dprint("Path = " + self.path)
+        log_debug("Path = " + self.path)
         if "/PxPACFile.pac" in self.path:
             resp = self.do_PAC()
         else:
             resp = self.__do_transaction()
 
         if resp.code >= 400:
-            dprint("Error %d" % resp.code)
+            log_debug("Error %d" % resp.code)
 
         self.__forward_response(resp)
 
-        dprint("Done")
+        log_debug("Done")
 
     def do_POST(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         self.do_GET()
 
-        dprint("Done")
+        log_debug("Done")
 
     def do_PUT(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         self.do_GET()
 
-        dprint("Done")
+        log_debug("Done")
 
     def do_DELETE(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         self.do_GET()
 
-        dprint("Done")
+        log_debug("Done")
 
     def do_PATCH(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         self.do_GET()
 
-        dprint("Done")
+        log_debug("Done")
 
     def do_CONNECT(self):
-        dprint("Entering")
+        log_debug("Entering")
 
         for i in ["connection", "Connection"]:
             if i in self.headers:
                 del self.headers[i]
-                dprint("Remove header " + i)
+                log_debug("Remove header " + i)
 
         cl = 0
         cs = 0
         resp = self.__do_transaction()
         if resp.code >= 400:
-            dprint("Error %d" % resp.code)
+            log_debug("Error %d" % resp.code)
             self.__forward_response(resp)
         else:
             # Proxy connection may be already closed due to header
             # (Proxy-)Connection: close received from proxy -> forward this to
             # the client
             if self.proxy_socket is None:
-                dprint("Proxy connection closed")
+                log_debug("Proxy connection closed")
                 self.send_response(200, "True")
                 self.send_header("Proxy-Connection", "close")
                 self.end_headers()
             else:
-                dprint("Tunneling through proxy")
+                log_debug("Tunneling through proxy")
                 self.send_response(200, "Connection established")
                 self.send_header("Proxy-Agent", self.version_string())
                 self.end_headers()
@@ -972,7 +1011,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                                 max_idle = time.time() + idle
                             else:
                                 # No data means connection closed by remote host
-                                dprint("Connection closed by %s" % source)
+                                log_debug("Connection closed by %s" % source)
                                 # Because tunnel is closed on one end there is
                                 # no need to read from both ends
                                 del rlist[:]
@@ -1005,11 +1044,11 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                                         wlist.remove(o)
                                 cs += bsnt
                             else:
-                                dprint("No data sent")
+                                log_debug("No data sent")
                         max_idle = time.time() + idle
                     if max_idle < time.time():
                         # No data in timeout seconds
-                        dprint("Proxy connection timeout")
+                        log_debug("Proxy connection timeout")
                         break
 
         # After serving the proxy tunnel it could not be used for samething else.
@@ -1019,22 +1058,22 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         # one side closes the connection. Close both proxy and client
         # connection if still open.
         if self.proxy_socket is not None:
-            dprint("Cleanup proxy connection")
+            log_debug("Cleanup proxy connection")
             self.proxy_socket.shutdown(socket.SHUT_WR)
             self.proxy_socket.close()
             self.proxy_socket = None
         self.close_connection = True
 
-        dprint("%d bytes read, %d bytes written" % (cl, cs))
+        log_debug("%d bytes read, %d bytes written" % (cl, cs))
 
-        dprint("Done")
+        log_debug("Done")
 
     def __forward_data(self, resp, discard=False):
         content_len = resp.length
-        dprint("Reading response data")
+        log_debug("Forwarding response data")
         if resp.body:
             if content_len:
-                dprint("Content length %d" % cl)
+                log_debug("Content length %d" % content_len)
                 while content_len > 0:
                     if content_len > 4096:
                         chunk_len = 4096
@@ -1046,37 +1085,37 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                     if not discard:
                         self.wfile.write(data)
             elif resp.chunked:
-                dprint("Chunked encoding")
+                log_debug("Chunked encoding")
                 while not State.exit:
                     line = self.__proxy_socket_file.readline(State.max_line)
                     if not discard:
                         self.wfile.write(line)
                     line = line.decode("utf-8").strip()
                     if not len(line):
-                        dprint("Blank chunk size")
+                        log_warn("Empty chunk")
                         break
                     else:
                         try:
                             chunk_len = int(line, 16) + 2
-                            dprint("Chunk of size %d" % csize)
+                            log_debug("Chunk of size %d" % chunk_len)
                         except ValueError:
-                            dprint("Bad chunk size '%s'" % line)
+                            log_error("Bad chunk size '%s'" % line)
                             continue
                     data = self.__proxy_socket_file.read(chunk_len)
                     if not discard:
                         self.wfile.write(data)
                     if chunk_len == 2:
-                        dprint("No more chunks")
+                        log_debug("No more chunks")
                         break
                     if len(data) < chunk_len:
-                        dprint("Chunk size doesn't match data")
+                        log_warn("Chunk size doesn't match data")
                         break
             elif resp.data is not None:
-                dprint("Sending data string")
                 if not discard:
+                    log_debug("Sending data")
                     self.wfile.write(resp.data)
             else:
-                dprint("Not sure how much")
+                log_debug("Reading data stream of unknown size")
                 while not State.exit:
                     time.sleep(0.1)
                     data = self.__proxy_socket_file.read(1024)
@@ -1086,23 +1125,23 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                         break
 
         if resp.close and self.proxy_socket:
-            dprint("Close proxy connection per header")
+            log_debug("Close proxy connection per header")
             self.proxy_socket.close()
             self.proxy_socket = None
 
     def __forward_response(self, resp):
-        dprint("Entering")
+        log_debug("Entering")
         self.send_response(resp.code)
 
         for header in resp.headers:
-            dprint("Returning %s: %s" % (header[0], header[1]))
+            log_debug("{}: {}".format(header[0], header[1]))
             self.send_header(header[0], header[1])
 
         self.end_headers()
 
         self.__forward_data(resp)
 
-        dprint("Done")
+        log_debug("Done")
 
     def __get_destination(self):
         netloc = self.path
@@ -1127,7 +1166,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 path = path + ";" + parse.params
             if parse.query:
                 path = path + "?" + parse.query
-        dprint(netloc)
+        log_debug(netloc)
 
         # Check destination for noproxy first, before doing any expensive stuff
         # possibly involving connections
@@ -1138,13 +1177,13 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 addr = socket.getaddrinfo(spl[0], int(spl[1]))
             except socket.gaierror:
                 # Couldn't resolve, let parent proxy try, #18
-                dprint("Couldn't resolve host")
+                log_debug("Couldn't resolve host")
             if len(addr) and len(addr[0]) == 5:
                 ipport = addr[0][4]
-                dprint("%s => %s + %s" % (self.path, ipport, path))
+                log_debug("%s => %s + %s" % (self.path, ipport, path))
 
                 if ipport[0] in State.noproxy:
-                    dprint("Direct connection from noproxy configuration")
+                    log_debug("Direct connection from noproxy configuration")
                     self.path = path
                     return ipport
 
@@ -1158,12 +1197,12 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
             if proxy_str == "DIRECT":
                 ipport = netloc.split(":")
                 ipport[1] = int(ipport[1])
-                dprint("Direct connection from PAC")
+                log_debug("Direct connection from PAC")
                 self.path = path
                 return tuple(ipport)
 
             if proxy_str:
-                dprint("Proxy from PAC = " + str(proxy_str))
+                log_debug("Proxy from PAC = " + str(proxy_str))
                 # parse_proxy does not modify State.proxy_server any more,
                 # it returns the proxy server tuples instead, because proxy_str
                 # contains only the proxy servers for URL served by this thread
@@ -1190,15 +1229,15 @@ class PoolMixIn(socketserver.ThreadingMixIn):
         self.pool.submit(self.process_request_thread, request, client_address)
 
     def verify_request(self, request, client_address):
-        dprint("Client address: %s" % client_address[0])
+        log_debug("Client address: %s" % client_address[0])
         if client_address[0] in State.allow:
             return True
 
         if State.hostonly and client_address[0] in get_host_ips():
-            dprint("Host-only IP allowed")
+            log_debug("Host-only IP allowed")
             return True
 
-        dprint("Client not allowed: %s" % client_address[0])
+        log_debug("Client not allowed: %s" % client_address[0])
         return False
 
 
@@ -1239,7 +1278,9 @@ def print_banner():
 
     for section in State.config.sections():
         for option in State.config.options(section):
-            dprint(section + ":" + option + " = " + State.config.get(section, option))
+            log_debug(
+                section + ":" + option + " = " + State.config.get(section, option)
+            )
 
 
 def serve_forever(httpd):
@@ -1247,7 +1288,7 @@ def serve_forever(httpd):
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        dprint("Exiting")
+        log_debug("Exiting")
         State.exit = True
 
     httpd.shutdown()
@@ -1382,7 +1423,7 @@ def winhttp_find_proxy_for_url(url, autodetect=False, pac_url=None, autologon=Tr
         WINHTTP_FLAG_ASYNC,
     )
     if not hInternet:
-        dprint("WinHttpOpen failed: " + str(ctypes.GetLastError()))
+        log_debug("WinHttpOpen failed: " + str(ctypes.GetLastError()))
         return ""
 
     autoproxy_options = WINHTTP_AUTOPROXY_OPTIONS()
@@ -1417,16 +1458,16 @@ def winhttp_find_proxy_for_url(url, autodetect=False, pac_url=None, autologon=Tr
     )
     if not ok:
         error = ctypes.GetLastError()
-        dprint("WinHttpGetProxyForUrl error %s" % error)
+        log_debug("WinHttpGetProxyForUrl error %s" % error)
         if error == WINHTTP_ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT:
-            dprint("Could not download PAC file, trying DIRECT instead")
+            log_debug("Could not download PAC file, trying DIRECT instead")
             return "DIRECT"
         return ""
 
     if proxy_info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY:
         # Note: proxy_info.lpszProxyBypass makes no sense here!
         if not proxy_info.lpszProxy:
-            dprint("WinHttpGetProxyForUrl named proxy without name")
+            log_debug("WinHttpGetProxyForUrl named proxy without name")
             return ""
         return (
             proxy_info.lpszProxy.replace(" ", ",")
@@ -1437,7 +1478,7 @@ def winhttp_find_proxy_for_url(url, autodetect=False, pac_url=None, autologon=Tr
         return "DIRECT"
 
     # WinHttpCloseHandle()
-    dprint("WinHttpGetProxyForUrl accesstype %s" % (proxy_info.dwAccessType,))
+    log_debug("WinHttpGetProxyForUrl accesstype %s" % (proxy_info.dwAccessType,))
     return ""
 
 
@@ -1468,7 +1509,7 @@ def load_proxy(quiet=False):
             "settings", "proxyreload"
         ):
             if not quiet:
-                dprint("Skip proxy refresh")
+                log_debug("Skip proxy refresh")
             return (proxy_mode, proxy_servers)
 
         # Start with clean proxy mode and server list
@@ -1482,7 +1523,7 @@ def load_proxy(quiet=False):
         )
         if not ok:
             if not quiet:
-                dprint(ctypes.GetLastError())
+                log_debug(ctypes.GetLastError())
         else:
             if ie_proxy_config.fAutoDetect:
                 proxy_mode = MODE_AUTO
@@ -1490,7 +1531,7 @@ def load_proxy(quiet=False):
                 State.pac = ie_proxy_config.lpszAutoConfigUrl
                 proxy_mode = MODE_PAC
                 if not quiet:
-                    dprint("AutoConfigURL = " + State.pac)
+                    log_debug("AutoConfigURL = " + State.pac)
             else:
                 # Manual proxy
                 proxies = []
@@ -1518,15 +1559,15 @@ def load_proxy(quiet=False):
                         ipns = netaddr.IPGlob(bypass)
                         State.noproxy.add(ipns)
                         if not quiet:
-                            dprint("Noproxy += " + bypass)
+                            log_debug("Noproxy += " + bypass)
                     except:
                         State.noproxy_hosts.append(bypass)
                         if not quiet:
-                            dprint("Noproxy hostname += " + bypass)
+                            log_debug("Noproxy hostname += " + bypass)
 
         State.proxy_refresh = time.time()
         if not quiet:
-            dprint("Proxy mode = " + str(proxy_mode))
+            log_debug("Proxy mode = " + str(proxy_mode))
         State.proxy_mode = proxy_mode
         State.proxy_server = proxy_servers
 
@@ -1550,7 +1591,7 @@ def find_proxy_for_url(url):
             host = State.config.get("proxy", "listen") or "localhost"
             port = State.config.getint("proxy", "port")
             pac = "http://%s:%d/PxPACFile.pac" % (host, port)
-            dprint("PAC URL is local: " + pac)
+            log_debug("PAC URL is local: " + pac)
         proxy_str = winhttp_find_proxy_for_url(url, pac_url=pac)
 
     # Handle edge case if the result is a list that starts with DIRECT. Assume
@@ -1564,7 +1605,7 @@ def find_proxy_for_url(url):
     if proxy_str == "":
         proxy_str = "DIRECT"
 
-    dprint("Proxy found: " + proxy_str)
+    log_debug("Proxy found: " + proxy_str)
     return proxy_str
 
 
@@ -1728,7 +1769,7 @@ def save():
 
 def parse_config():
     if "--debug" in sys.argv:
-        State.logger = Log(dfile(), "w")
+        State.logger = Log(get_log_file_path(), "w")
 
     if getattr(sys, "frozen", False) != False or "pythonw.exe" in sys.executable:
         attach_console()
@@ -1780,7 +1821,7 @@ def parse_config():
 
     cfg_int_init("settings", "log", "0" if State.logger is None else "1")
     if State.config.get("settings", "log") == "1" and State.logger is None:
-        State.logger = Log(dfile(), "w")
+        State.logger = Log(get_log_file_path(), "w")
 
     # Command line flags
     for i in range(len(sys.argv)):
@@ -1930,7 +1971,7 @@ def handle_exceptions(extype, value, tb):
         sys.stderr.write(tracelog)
 
         # Save to debug.log
-        dbg = open(dfile(), "w")
+        dbg = open(get_log_file_path(), "w")
         dbg.write(tracelog)
         dbg.close()
 
@@ -2013,7 +2054,7 @@ def uninstall():
 
 def attach_console():
     if ctypes.windll.kernel32.GetConsoleWindow() != 0:
-        dprint("Already attached to a console")
+        log_debug("Already attached to a console")
         return
 
     # Find parent cmd.exe if exists
@@ -2040,16 +2081,18 @@ def attach_console():
 
     # Not found, started without console
     if pid == -1:
-        dprint("No parent console to attach to")
+        log_debug("No parent console to attach to")
         return
 
-    dprint("Attaching to console " + str(pid))
+    log_debug("Attaching to console " + str(pid))
     if ctypes.windll.kernel32.AttachConsole(pid) == 0:
-        dprint("Attach failed with error " + str(ctypes.windll.kernel32.GetLastError()))
+        log_debug(
+            "Attach failed with error " + str(ctypes.windll.kernel32.GetLastError())
+        )
         return
 
     if ctypes.windll.kernel32.GetConsoleWindow() == 0:
-        dprint("Not a console window")
+        log_debug("Not a console window")
         return
 
     reopen_stdout()
@@ -2062,12 +2105,12 @@ def detach_console():
     restore_stdout()
 
     if not ctypes.windll.kernel32.FreeConsole():
-        dprint(
+        log_debug(
             "Free console failed with error "
             + str(ctypes.windll.kernel32.GetLastError())
         )
     else:
-        dprint("Freed console successfully")
+        log_debug("Freed console successfully")
 
 
 ###
