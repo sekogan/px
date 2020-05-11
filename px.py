@@ -829,12 +829,11 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         self.__forward_response_data(resp, discard=True)
 
-        hconnection = ""
-        for i in ["connection", "Connection"]:
-            if i in self.headers:
-                hconnection = self.headers[i]
-                del self.headers[i]
-                log_debug("Remove header %s: %s" % (i, hconnection))
+        connection_header_value = None
+        for name in ["connection", "Connection"]:
+            if name in self.headers:
+                connection_header_value = self.headers.pop(name)
+                log_debug("Remove header %s: %s" % (name, connection_header_value))
 
         # Send auth message
         resp = self.__do_request(
@@ -871,9 +870,9 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         self.__forward_response_data(resp, discard=True)
 
-        if hconnection != "":
-            self.headers["Connection"] = hconnection
-            log_debug("Restore header Connection: " + hconnection)
+        if connection_header_value is not None:
+            self.headers["Connection"] = connection_header_value
+            log_debug("Restore header Connection: " + connection_header_value)
 
         # Reply to challenge
         resp = self.__do_request(
