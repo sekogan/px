@@ -563,7 +563,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
     def log_message(self, format, *args):
         log_debug(format % args)
 
-    def __connect_socket(self, destination=None):
+    def __ensure_connected_to(self, destination=None):
         # Already connected?
         if self.proxy_socket is not None:
             return True
@@ -601,7 +601,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         log_debug("Entering")
 
         # Connect to proxy or destination
-        if not self.__connect_socket(destination):
+        if not self.__ensure_connected_to(destination):
             return Response(408)
 
         # No chit chat on SSL
@@ -617,29 +617,30 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
         self.proxy_socket.sendall(command_line.encode("utf-8"))
         log_debug(command_line.strip())
         for header in self.headers:
-            header_lc = header.lower()
-            if header_lc == "user-agent" and State.useragent != "":
+            header_lowercased = header.lower()
+            if header_lowercased == "user-agent" and State.useragent != "":
                 user_agent_sent = True
                 header_line = "%s: %s\r\n" % (header, State.useragent)
             else:
                 header_line = "%s: %s\r\n" % (header, self.headers[header])
 
             self.proxy_socket.sendall(header_line.encode("utf-8"))
-            if header_lc != "authorization":
+            if header_lowercased != "authorization":
                 log_debug("Sending %s" % header_line.strip())
             else:
                 log_debug("Sending %s: %s" % (header, "*" * len(self.headers[header])))
 
-            if header_lc == "content-length":
+            if header_lowercased == "content-length":
                 content_len = int(self.headers[header])
             elif (
-                header_lc == "expect" and self.headers[header].lower() == "100-continue"
+                header_lowercased == "expect"
+                and self.headers[header].lower() == "100-continue"
             ):
                 expect = True
-            elif header_lc == "proxy-connection":
+            elif header_lowercased == "proxy-connection":
                 keepalive = True
             elif (
-                header_lc == "transfer-encoding"
+                header_lowercased == "transfer-encoding"
                 and self.headers[header].lower() == "chunked"
             ):
                 log_debug("CHUNKED data")
@@ -751,7 +752,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
     def __detect_proxy_type(self):
         # Connect to proxy
         if not hasattr(self, "proxy_address"):
-            if not self.__connect_socket():
+            if not self.__ensure_connected_to():
                 return Response(408), None
 
         with State.proxy_type_lock:
