@@ -1319,8 +1319,8 @@ def start_worker(pipeout):
         Proxy,
         bind_and_activate=False,
     )
-    mainsock = socket.fromshare(pipeout.recv())
-    httpd.socket = mainsock
+    server_socket = socket.fromshare(pipeout.recv())
+    httpd.socket = server_socket
 
     print_banner()
 
@@ -1343,20 +1343,20 @@ def run_pool():
             pprint(exc)
         return
 
-    mainsock = httpd.socket
+    server_socket = httpd.socket
 
     print_banner()
 
     if hasattr(socket, "fromshare"):
         workers = State.config.getint("settings", "workers")
-        for i in range(workers - 1):
-            (pipeout, pipein) = multiprocessing.Pipe()
+        for _ in range(workers - 1):
+            pipeout, pipein = multiprocessing.Pipe()
             p = multiprocessing.Process(target=start_worker, args=(pipeout,))
             p.daemon = True
             p.start()
             while p.pid is None:
                 time.sleep(1)
-            pipein.send(mainsock.share(p.pid))
+            pipein.send(server_socket.share(p.pid))
 
     serve_forever(httpd)
 
