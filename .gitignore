@@ -51,3 +51,9 @@ debug-*
 .vscode
 testrun
 *.egg-info
+
+# Python virtual environment files
+/bin/
+/lib/
+/lib64
+pyvenv.cfg

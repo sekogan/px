@@ -4,11 +4,16 @@ from __future__ import print_function
 
 __version__ = "0.4.0"
 
+import os
+
+is_windows = os.name == "nt"
+
 import base64
 import ctypes
-import ctypes.wintypes
+
+if is_windows:
+    import ctypes.wintypes
 import multiprocessing
-import os
 import select
 import signal
 import socket
@@ -44,18 +49,19 @@ except ImportError:
     pprint("Requires module psutil")
     sys.exit()
 
-try:
-    import pywintypes
-    import sspi
-except ImportError:
-    pprint("Requires module pywin32")
-    sys.exit()
+if is_windows:
+    try:
+        import pywintypes
+        import sspi
+    except ImportError:
+        pprint("Requires module pywin32")
+        sys.exit()
 
-try:
-    import winkerberos
-except ImportError:
-    pprint("Requires module winkerberos")
-    sys.exit()
+    try:
+        import winkerberos
+    except ImportError:
+        pprint("Requires module winkerberos")
+        sys.exit()
 
 try:
     import ntlm_auth.ntlm
@@ -65,12 +71,14 @@ except ImportError:
 
 try:
     import keyring
-    import keyring.backends.Windows
-
-    keyring.set_keyring(keyring.backends.Windows.WinVaultKeyring())
 except ImportError:
     pprint("Requires module keyring")
     sys.exit()
+
+if is_windows:
+    import keyring.backends.Windows
+
+    keyring.set_keyring(keyring.backends.Windows.WinVaultKeyring())
 
 # Python 2.x vs 3.x support
 try:
@@ -78,16 +86,21 @@ try:
     import http.server as httpserver
     import socketserver
     import urllib.parse as urlparse
-    import winreg
 except ImportError:
     import ConfigParser as configparser
     import SimpleHTTPServer as httpserver
     import SocketServer as socketserver
     import urlparse
-    import _winreg as winreg
 
     os.getppid = psutil.Process().ppid
-    PermissionError = WindowsError
+
+if is_windows:
+    try:
+        import winreg
+    except ImportError:
+        import _winreg as winreg
+
+        PermissionError = WindowsError
 
 HELP = (
     """Px v%s
@@ -218,14 +231,15 @@ Configuration:
     % __version__
 )
 
-# Windows version
-#  6.1 = Windows 7
-#  6.2 = Windows 8
-#  6.3 = Windows 8.1
-# 10.0 = Windows 10
-WIN_VERSION = float(
-    str(sys.getwindowsversion().major) + "." + str(sys.getwindowsversion().minor)
-)
+if is_windows:
+    # Windows version
+    #  6.1 = Windows 7
+    #  6.2 = Windows 8
+    #  6.3 = Windows 8.1
+    # 10.0 = Windows 10
+    WIN_VERSION = float(
+        str(sys.getwindowsversion().major) + "." + str(sys.getwindowsversion().minor)
+    )
 
 # Proxy modes - source of proxy info
 MODE_NONE = 0
@@ -1002,7 +1016,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
                 max_idle = time.time() + idle
                 while not State.exit and (rlist or wlist):
                     (readable, writable, failed) = select.select(
-                        rlist, wlist, xlist=rlist, timeout=idle
+                        rlist, wlist, rlist, idle
                     )
                     if failed:
                         break
@@ -1205,7 +1219,7 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
 
         # Get proxy mode and servers straight from load_proxy to avoid
         # threading issues
-        (proxy_mode, self.proxy_servers) = load_proxy()
+        (proxy_mode, self.proxy_servers) = _load_proxy_settings()
         if proxy_mode in [MODE_AUTO, MODE_PAC, MODE_CONFIG_PAC]:
             proxy_str = find_proxy_for_url(
                 ("https://" if "://" not in self.path else "") + self.path
@@ -1365,137 +1379,134 @@ def run_pool():
 ###
 # Proxy detection
 
+if is_windows:
 
-class WINHTTP_CURRENT_USER_IE_PROXY_CONFIG(ctypes.Structure):
-    _fields_ = [
-        ("fAutoDetect", ctypes.wintypes.BOOL),
-        # "Automatically detect settings"
-        ("lpszAutoConfigUrl", ctypes.wintypes.LPWSTR),
-        # "Use automatic configuration script, Address"
-        ("lpszProxy", ctypes.wintypes.LPWSTR),
-        # "1.2.3.4:5" if "Use the same proxy server for all protocols",
-        # else advanced
-        # "ftp=1.2.3.4:5;http=1.2.3.4:5;https=1.2.3.4:5;socks=1.2.3.4:5"
-        ("lpszProxyBypass", ctypes.wintypes.LPWSTR),
-        # ";"-separated list
-        # "Bypass proxy server for local addresses" adds "<local>"
-    ]
+    class WINHTTP_CURRENT_USER_IE_PROXY_CONFIG(ctypes.Structure):
+        _fields_ = [
+            ("fAutoDetect", ctypes.wintypes.BOOL),
+            # "Automatically detect settings"
+            ("lpszAutoConfigUrl", ctypes.wintypes.LPWSTR),
+            # "Use automatic configuration script, Address"
+            ("lpszProxy", ctypes.wintypes.LPWSTR),
+            # "1.2.3.4:5" if "Use the same proxy server for all protocols",
+            # else advanced
+            # "ftp=1.2.3.4:5;http=1.2.3.4:5;https=1.2.3.4:5;socks=1.2.3.4:5"
+            ("lpszProxyBypass", ctypes.wintypes.LPWSTR),
+            # ";"-separated list
+            # "Bypass proxy server for local addresses" adds "<local>"
+        ]
 
+    class WINHTTP_AUTOPROXY_OPTIONS(ctypes.Structure):
+        _fields_ = [
+            ("dwFlags", ctypes.wintypes.DWORD),
+            ("dwAutoDetectFlags", ctypes.wintypes.DWORD),
+            ("lpszAutoConfigUrl", ctypes.wintypes.LPCWSTR),
+            ("lpvReserved", ctypes.c_void_p),
+            ("dwReserved", ctypes.wintypes.DWORD),
+            ("fAutoLogonIfChallenged", ctypes.wintypes.BOOL),
+        ]
 
-class WINHTTP_AUTOPROXY_OPTIONS(ctypes.Structure):
-    _fields_ = [
-        ("dwFlags", ctypes.wintypes.DWORD),
-        ("dwAutoDetectFlags", ctypes.wintypes.DWORD),
-        ("lpszAutoConfigUrl", ctypes.wintypes.LPCWSTR),
-        ("lpvReserved", ctypes.c_void_p),
-        ("dwReserved", ctypes.wintypes.DWORD),
-        ("fAutoLogonIfChallenged", ctypes.wintypes.BOOL),
-    ]
+    class WINHTTP_PROXY_INFO(ctypes.Structure):
+        _fields_ = [
+            ("dwAccessType", ctypes.wintypes.DWORD),
+            ("lpszProxy", ctypes.wintypes.LPCWSTR),
+            ("lpszProxyBypass", ctypes.wintypes.LPCWSTR),
+        ]
 
+    # Parameters for WinHttpOpen, http://msdn.microsoft.com/en-us/library/aa384098(VS.85).aspx
+    WINHTTP_NO_PROXY_NAME = 0
+    WINHTTP_NO_PROXY_BYPASS = 0
+    WINHTTP_FLAG_ASYNC = 0x10000000
 
-class WINHTTP_PROXY_INFO(ctypes.Structure):
-    _fields_ = [
-        ("dwAccessType", ctypes.wintypes.DWORD),
-        ("lpszProxy", ctypes.wintypes.LPCWSTR),
-        ("lpszProxyBypass", ctypes.wintypes.LPCWSTR),
-    ]
+    # dwFlags values
+    WINHTTP_AUTOPROXY_AUTO_DETECT = 0x00000001
+    WINHTTP_AUTOPROXY_CONFIG_URL = 0x00000002
 
+    # dwAutoDetectFlags values
+    WINHTTP_AUTO_DETECT_TYPE_DHCP = 0x00000001
+    WINHTTP_AUTO_DETECT_TYPE_DNS_A = 0x00000002
 
-# Parameters for WinHttpOpen, http://msdn.microsoft.com/en-us/library/aa384098(VS.85).aspx
-WINHTTP_NO_PROXY_NAME = 0
-WINHTTP_NO_PROXY_BYPASS = 0
-WINHTTP_FLAG_ASYNC = 0x10000000
+    # dwAccessType values
+    WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
+    WINHTTP_ACCESS_TYPE_NO_PROXY = 1
+    WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4
 
-# dwFlags values
-WINHTTP_AUTOPROXY_AUTO_DETECT = 0x00000001
-WINHTTP_AUTOPROXY_CONFIG_URL = 0x00000002
+    # Error messages
+    WINHTTP_ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT = 12167
 
-# dwAutoDetectFlags values
-WINHTTP_AUTO_DETECT_TYPE_DHCP = 0x00000001
-WINHTTP_AUTO_DETECT_TYPE_DNS_A = 0x00000002
+    def winhttp_find_proxy_for_url(url, autodetect=False, pac_url=None, autologon=True):
+        # Fix issue #51
+        ACCESS_TYPE = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+        if WIN_VERSION < 6.3:
+            ACCESS_TYPE = WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
 
-# dwAccessType values
-WINHTTP_ACCESS_TYPE_DEFAULT_PROXY = 0
-WINHTTP_ACCESS_TYPE_NO_PROXY = 1
-WINHTTP_ACCESS_TYPE_NAMED_PROXY = 3
-WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY = 4
-
-# Error messages
-WINHTTP_ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT = 12167
-
-
-def winhttp_find_proxy_for_url(url, autodetect=False, pac_url=None, autologon=True):
-    # Fix issue #51
-    ACCESS_TYPE = WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
-    if WIN_VERSION < 6.3:
-        ACCESS_TYPE = WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
-
-    ctypes.windll.winhttp.WinHttpOpen.restype = ctypes.c_void_p
-    hInternet = ctypes.windll.winhttp.WinHttpOpen(
-        ctypes.wintypes.LPCWSTR("Px"),
-        ACCESS_TYPE,
-        WINHTTP_NO_PROXY_NAME,
-        WINHTTP_NO_PROXY_BYPASS,
-        WINHTTP_FLAG_ASYNC,
-    )
-    if not hInternet:
-        log_debug("WinHttpOpen failed: " + str(ctypes.GetLastError()))
-        return ""
-
-    autoproxy_options = WINHTTP_AUTOPROXY_OPTIONS()
-    if pac_url:
-        autoproxy_options.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL
-        autoproxy_options.dwAutoDetectFlags = 0
-        autoproxy_options.lpszAutoConfigUrl = pac_url
-    elif autodetect:
-        autoproxy_options.dwFlags = WINHTTP_AUTOPROXY_AUTO_DETECT
-        autoproxy_options.dwAutoDetectFlags = (
-            WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A
+        ctypes.windll.winhttp.WinHttpOpen.restype = ctypes.c_void_p
+        hInternet = ctypes.windll.winhttp.WinHttpOpen(
+            ctypes.wintypes.LPCWSTR("Px"),
+            ACCESS_TYPE,
+            WINHTTP_NO_PROXY_NAME,
+            WINHTTP_NO_PROXY_BYPASS,
+            WINHTTP_FLAG_ASYNC,
         )
-        autoproxy_options.lpszAutoConfigUrl = 0
-    else:
-        return ""
-    autoproxy_options.fAutoLogonIfChallenged = autologon
-
-    proxy_info = WINHTTP_PROXY_INFO()
-
-    # Fix issue #43
-    ctypes.windll.winhttp.WinHttpGetProxyForUrl.argtypes = [
-        ctypes.c_void_p,
-        ctypes.wintypes.LPCWSTR,
-        ctypes.POINTER(WINHTTP_AUTOPROXY_OPTIONS),
-        ctypes.POINTER(WINHTTP_PROXY_INFO),
-    ]
-    ok = ctypes.windll.winhttp.WinHttpGetProxyForUrl(
-        hInternet,
-        ctypes.wintypes.LPCWSTR(url),
-        ctypes.byref(autoproxy_options),
-        ctypes.byref(proxy_info),
-    )
-    if not ok:
-        error = ctypes.GetLastError()
-        log_debug("WinHttpGetProxyForUrl error %s" % error)
-        if error == WINHTTP_ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT:
-            log_debug("Could not download PAC file, trying DIRECT instead")
-            return "DIRECT"
-        return ""
-
-    if proxy_info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY:
-        # Note: proxy_info.lpszProxyBypass makes no sense here!
-        if not proxy_info.lpszProxy:
-            log_debug("WinHttpGetProxyForUrl named proxy without name")
+        if not hInternet:
+            log_debug("WinHttpOpen failed: " + str(ctypes.GetLastError()))
             return ""
-        return (
-            proxy_info.lpszProxy.replace(" ", ",")
-            .replace(";", ",")
-            .replace(",DIRECT", "")
-        )  # Note: We only see the first!
-    if proxy_info.dwAccessType == WINHTTP_ACCESS_TYPE_NO_PROXY:
-        return "DIRECT"
 
-    # WinHttpCloseHandle()
-    log_debug("WinHttpGetProxyForUrl accesstype %s" % (proxy_info.dwAccessType,))
-    return ""
+        autoproxy_options = WINHTTP_AUTOPROXY_OPTIONS()
+        if pac_url:
+            autoproxy_options.dwFlags = WINHTTP_AUTOPROXY_CONFIG_URL
+            autoproxy_options.dwAutoDetectFlags = 0
+            autoproxy_options.lpszAutoConfigUrl = pac_url
+        elif autodetect:
+            autoproxy_options.dwFlags = WINHTTP_AUTOPROXY_AUTO_DETECT
+            autoproxy_options.dwAutoDetectFlags = (
+                WINHTTP_AUTO_DETECT_TYPE_DHCP | WINHTTP_AUTO_DETECT_TYPE_DNS_A
+            )
+            autoproxy_options.lpszAutoConfigUrl = 0
+        else:
+            return ""
+        autoproxy_options.fAutoLogonIfChallenged = autologon
+
+        proxy_info = WINHTTP_PROXY_INFO()
+
+        # Fix issue #43
+        ctypes.windll.winhttp.WinHttpGetProxyForUrl.argtypes = [
+            ctypes.c_void_p,
+            ctypes.wintypes.LPCWSTR,
+            ctypes.POINTER(WINHTTP_AUTOPROXY_OPTIONS),
+            ctypes.POINTER(WINHTTP_PROXY_INFO),
+        ]
+        ok = ctypes.windll.winhttp.WinHttpGetProxyForUrl(
+            hInternet,
+            ctypes.wintypes.LPCWSTR(url),
+            ctypes.byref(autoproxy_options),
+            ctypes.byref(proxy_info),
+        )
+        if not ok:
+            error = ctypes.GetLastError()
+            log_debug("WinHttpGetProxyForUrl error %s" % error)
+            if error == WINHTTP_ERROR_WINHTTP_UNABLE_TO_DOWNLOAD_SCRIPT:
+                log_debug("Could not download PAC file, trying DIRECT instead")
+                return "DIRECT"
+            return ""
+
+        if proxy_info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY:
+            # Note: proxy_info.lpszProxyBypass makes no sense here!
+            if not proxy_info.lpszProxy:
+                log_debug("WinHttpGetProxyForUrl named proxy without name")
+                return ""
+            return (
+                proxy_info.lpszProxy.replace(" ", ",")
+                .replace(";", ",")
+                .replace(",DIRECT", "")
+            )  # Note: We only see the first!
+        if proxy_info.dwAccessType == WINHTTP_ACCESS_TYPE_NO_PROXY:
+            return "DIRECT"
+
+        # WinHttpCloseHandle()
+        log_debug("WinHttpGetProxyForUrl accesstype %s" % (proxy_info.dwAccessType,))
+        return ""
 
 
 def file_url_to_local_path(file_url):
@@ -1509,15 +1520,24 @@ def file_url_to_local_path(file_url):
         return path
 
 
-def load_proxy(quiet=False):
+def _load_proxy_settings(quiet=False):
     # Return if proxies specified in Px config
     if State.proxy_mode in [MODE_CONFIG, MODE_CONFIG_PAC]:
         return (State.proxy_mode, State.proxy_server)
 
+    return _load_proxy_settings_from_system(quiet)
+
+
+def _load_proxy_settings_from_system(quiet=False):
+    if is_windows:
+        return _load_proxy_settings_from_windows(quiet)
+    return (State.proxy_mode, State.proxy_server)
+
+
+def _load_proxy_settings_from_windows(quiet=False):
     # Do locking to avoid updating globally shared State object by multiple
     # threads simultaneously
-    State.proxy_mode_lock.acquire()
-    try:
+    with State.proxy_mode_lock:
         proxy_mode = State.proxy_mode
         proxy_servers = State.proxy_server
         # Check if need to refresh
@@ -1589,9 +1609,6 @@ def load_proxy(quiet=False):
 
         # Clear proxy types on proxy server update
         State.proxy_type = {}
-
-    finally:
-        State.proxy_mode_lock.release()
 
     return (proxy_mode, proxy_servers)
 
@@ -1918,7 +1935,7 @@ def parse_config():
     elif State.pac:
         State.proxy_mode = MODE_CONFIG_PAC
     else:
-        load_proxy(quiet=True)
+        _load_proxy_settings(quiet=True)
 
     if State.proxy_mode == MODE_NONE and not State.config.get("proxy", "noproxy"):
         pprint("No proxy server or noproxy list defined")
