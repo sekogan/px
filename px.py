@@ -977,10 +977,10 @@ class Proxy(httpserver.SimpleHTTPRequestHandler):
     def do_CONNECT(self):
         log_debug("Entering")
 
-        for socket_ in ["connection", "Connection"]:
-            if socket_ in self.headers:
-                del self.headers[socket_]
-                log_debug("Removed header " + socket_)
+        for name in ["connection", "Connection"]:
+            if name in self.headers:
+                del self.headers[name]
+                log_debug("Removed header " + name)
 
         bytes_read = 0
         bytes_written = 0
